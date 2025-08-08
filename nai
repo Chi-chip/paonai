@@ -1,0 +1,230 @@
+#include <stc15.h>
+#include <intrins.h>
+#include <uart.h>
+#include <adc.h>
+#include <pwm.h>
+#include <tft.h>
+#include <string.h>
+
+// 引脚定义
+sbit HEATER = P1^0;       // 加热模块控制
+sbit PUMP = P1^1;         // 水泵控制
+sbit MOTOR = P1^2;        // 直流无刷电机控制
+sbit BUZZER = P1^3;       // 蜂鸣器
+sbit LED_STATUS = P1^4;   // LED指示灯
+sbit NTC = P3^0;          // NTC温度传感器
+sbit LOAD_CELL = P3^1;    // 重量传感器
+sbit KEY_SELECT = P3^2;   // 按键（选择）
+sbit KEY_CONFIRM = P3^3;  // 按键（确认）
+
+// 全局变量
+float current_temp = 0.0;      // 当前水温
+float target_temp = 37.0;      // 目标水温
+float current_weight = 0.0;    // 当前水量/奶粉量
+float target_water = 100.0;    // 目标水量 (ml)
+float target_powder = 5.0;     // 目标奶粉量 (g)
+unsigned char mode = 0;        // 冲泡模式 (0-3, 对应4组配方)
+unsigned char status = 0;      // 设备状态 (0:待机, 1:加热, 2:出水, 3:出粉, 4:完成, 5:故障)
+float recipes[4][3] = {        // 配方记忆：{水温, 水量, 奶粉量}
+    {37.0, 100.0, 5.0},       // 配方1
+    {40.0, 150.0, 7.5},       // 配方2
+    {37.0, 200.0, 10.0},      // 配方3
+    {38.0, 120.0, 6.0}        // 配方4
+};
+
+// 温度查表（NTC电阻与温度对应，简化示例）
+const float ntc_table[10][2] = {
+    {10000, 25.0}, {8000, 30.0}, {6000, 35.0}, {4500, 40.0}, {3500, 45.0},
+    {2700, 50.0}, {2100, 55.0}, {1600, 60.0}, {1200, 65.0}, {900, 70.0}
+};
+
+// PID参数
+float Kp = 2.0, Ki = 0.5, Kd = 0.1;
+float error = 0.0, last_error = 0.0, integral = 0.0;
+
+// 初始化系统
+void init_system() {
+    init_adc();        // 初始化ADC
+    init_pwm();        // 初始化PWM
+    init_uart();       // 初始化UART（用于调试或蓝牙）
+    init_tft();        // 初始化TFT屏幕
+    P1 = 0x00;         // 初始化引脚
+    status = 0;        // 待机状态
+}
+
+// 温度传感器读取
+float read_temperature() {
+    unsigned int adc_value = adc_read(NTC); // 读取ADC值
+    float resistance = (float)(1023 - adc_value) * 10000 / adc_value; // 计算NTC电阻
+    for (int i = 0; i < 9; i++) {
+        if (resistance >= ntc_table[i][0] && resistance < ntc_table[i+1][0]) {
+            // 线性插值
+            float temp = ntc_table[i][1] + (ntc_table[i+1][1] - ntc_table[i][1]) *
+                         (resistance - ntc_table[i][0]) / (ntc_table[i+1][0] - ntc_table[i][0]);
+            return temp;
+        }
+    }
+    return 25.0; // 默认值，防止异常
+}
+
+// 重量传感器读取与滤波
+float read_weight() {
+    unsigned int raw = adc_read(LOAD_CELL); // 读取ADC值
+    static float history[5] = {0};          // 滑动窗口滤波
+    static unsigned char index = 0;
+    history[index] = (float)raw * 0.01;     // 假设0.01为校准系数
+    index = (index + 1) % 5;
+    
+    // 均值滤波
+    float sum = 0.0;
+    for (int i = 0; i < 5; i++) sum += history[i];
+    float filtered = sum / 5.0;
+    
+    // 去皮处理
+    static float tare = 0.0;
+    if (KEY_CONFIRM == 0 && status == 0) { // 长按确认键去皮
+        tare = filtered;
+    }
+    return filtered - tare;
+}
+
+// PID温度控制
+void pid_control() {
+    error = target_temp - current_temp;
+    integral += error;
+    float derivative = error - last_error;
+    float output = Kp * error + Ki * integral + Kd * derivative;
+    
+    // 限制PWM占空比 (0-100%)
+    if (output > 100.0) output = 100.0;
+    if (output < 0.0) output = 0.0;
+    
+    pwm_set_duty(HEATER, (unsigned char)output);
+    last_error = error;
+}
+
+// 水泵控制
+void control_pump(float target) {
+    current_weight = read_weight();
+    if (current_weight < target) {
+        PUMP = 1; // 开启水泵
+        status = 2; // 出水状态
+    } else {
+        PUMP = 0; // 关闭水泵
+    }
+}
+
+// 直流无刷电机控制（奶粉量）
+void control_motor(float target) {
+    current_weight = read_weight();
+    if (current_weight < target) {
+        // 假设1g奶粉对应100步
+        unsigned int steps = (unsigned int)(target * 100);
+        motor_step(MOTOR, steps); // 调用步进控制函数
+        status = 3; // 出粉状态
+    }
+}
+
+// 按键检测与消抖
+unsigned char read_key() {
+    static unsigned char last_state = 1;
+    if (KEY_SELECT == 0 && last_state == 1) {
+        delay_ms(20); // 消抖
+        if (KEY_SELECT == 0) {
+            last_state = 0;
+            return 1; // 按下选择键
+        }
+    } else if (KEY_SELECT == 1) {
+        last_state = 1;
+    }
+    return 0;
+}
+
+// TFT屏幕显示
+void update_display() {
+    tft_clear();
+    tft_draw_text(10, 10, "Temp: ");
+    tft_draw_float(50, 10, current_temp, 1);
+    tft_draw_text(10, 30, "Water: ");
+    tft_draw_float(50, 30, current_weight, 1);
+    tft_draw_text(10, 50, "Mode: ");
+    tft_draw_number(50, 50, mode);
+    
+    if (status == 5) {
+        tft_draw_text(10, 70, "Error!");
+    } else if (status == 4) {
+        tft_draw_text(10, 70, "Done!");
+    }
+}
+
+// 蜂鸣器提示
+void buzzer_alert(unsigned char type) {
+    if (type == 1) { // 完成提示
+        BUZZER = 1; delay_ms(200); BUZZER = 0;
+    } else if (type == 2) { // 故障提示
+        for (int i = 0; i < 3; i++) {
+            BUZZER = 1; delay_ms(100); BUZZER = 0; delay_ms(100);
+        }
+    }
+}
+
+// 主函数
+void main() {
+    init_system();
+    while (1) {
+        // 读取传感器数据
+        current_temp = read_temperature();
+        current_weight = read_weight();
+        
+        // 按键处理
+        if (read_key()) {
+            mode = (mode + 1) % 4; // 切换配方
+            target_temp = recipes[mode][0];
+            target_water = recipes[mode][1];
+            target_powder = recipes[mode][2];
+        }
+        
+        // 状态机
+        switch (status) {
+            case 0: // 待机
+                HEATER = 0; PUMP = 0; MOTOR = 0;
+                LED_STATUS = 0;
+                break;
+            case 1: // 加热
+                if (current_temp < target_temp) {
+                    pid_control();
+                } else {
+                    HEATER = 0;
+                    status = 2; // 进入出水
+                }
+                break;
+            case 2: // 出水
+                control_pump(target_water);
+                if (current_weight >= target_water) {
+                    status = 3; // 进入出粉
+                }
+                break;
+            case 3: // 出粉
+                control_motor(target_powder);
+                if (current_weight >= target_powder) {
+                    status = 4; // 完成
+                    buzzer_alert(1);
+                    LED_STATUS = 1;
+                }
+                break;
+            case 5: // 故障
+                HEATER = 0; PUMP = 0; MOTOR = 0;
+                buzzer_alert(2);
+                break;
+        }
+        
+        // 故障检测
+        if (current_temp > 45.0 || current_weight > 500.0) {
+            status = 5; // 温度或重量异常
+        }
+        
+        // 更新显示
+        update_display();
+        delay_ms(100); // 100ms循环
+    }
+}
