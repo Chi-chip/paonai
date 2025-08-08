@@ -1,0 +1,311 @@
+//======================================================================
+// 1. 包含库文件 (请确保您已在Arduino IDE中安装这些库)
+//======================================================================
+#include <TFT_eSPI.h> // 假设使用TFT_eSPI库
+#include <HX711.h>    // 假设使用HX711库
+#include <SPI.h>      // TFT屏幕可能需要
+
+//======================================================================
+// 2. 硬件引脚定义 (!!!请根据您的实际电路板修改!!!)
+//======================================================================
+// 传感器
+#define TEMP_ADC_PIN        A0  // 温度传感器ADC输入引脚
+#define LOADCELL_DOUT_PIN   3   // 重量传感器 HX711 DOUT
+#define LOADCELL_SCK_PIN    2   // 重量传感器 HX711 SCK
+
+// 执行器
+#define HEATER_PWM_PIN      5   // 加热模块PWM控制引脚
+#define PUMP_GPIO_PIN       6   // 水泵GPIO控制引脚
+#define MOTOR_STEP_PIN      7   // 步进电机STEP引脚
+#define MOTOR_DIR_PIN       8   // 步进电机DIR引脚
+
+// 人机交互
+#define BUTTON_START_PIN    12  // “开始”按键
+#define BUZZER_PIN          10  // 蜂鸣器引脚
+
+//======================================================================
+// 3. 全局常量和校准值 (!!!请根据您的实际测量进行校准!!!)
+//======================================================================
+// 温度传感器校准 (这里使用简化的B值法)
+#define VCC                 3.3
+#define R_DIVIDER           10000.0 // NTC分压电阻10kΩ
+#define NTC_B_VALUE         3950.0  // NTC的B值
+#define NTC_NOMINAL_RES     10000.0 // NTC在25°C时的标称电阻
+
+// 重量传感器校准
+#define WEIGHT_CAL_FACTOR   -450.0  // !!!必须通过放置已知重量的物体来校准!!!
+
+// 电机校准
+#define POWDER_PER_STEP     0.05    // 假设值：每步输出0.05克奶粉, 必须校准!
+
+// PID参数 (!!!需要通过调试整定以达到最佳控温效果!!!)
+double Kp = 5.0;
+double Ki = 0.8;
+double Kd = 1.5;
+
+//======================================================================
+// 4. 全局变量和对象实例化
+//======================================================================
+// 状态机定义
+enum MachineState {
+  IDLE,
+  HEATING,
+  DISPENSING_WATER,
+  TARING_AFTER_WATER,
+  DISPENSING_POWDER,
+  COMPLETE,
+  ERROR
+};
+MachineState currentState = IDLE;
+
+// 配方结构体
+struct Formula {
+  float targetTemp;   // 目标温度 (摄氏度)
+  float targetWater;  // 目标水量 (克/毫升)
+  float targetPowder; // 目标奶粉量 (克)
+};
+
+// 当前设定的配方和预设配方
+Formula currentFormula;
+Formula savedFormulas[3] = { // 模拟记忆功能
+  {45.0, 120.0, 15.0}, // 配方1
+  {50.0, 150.0, 18.0}, // 配方2
+  {40.0, 90.0,  12.0}  // 配方3
+};
+
+// 实时数据
+float currentTemp = 0.0;
+float currentWeight = 0.0;
+String statusMessage = "待机中";
+
+// PID控制相关变量
+double pidSetpoint, pidInput, pidOutput;
+double ITerm, lastInput;
+unsigned long lastPidComputeTime = 0;
+
+// 实例化对象
+TFT_eSPI tft = TFT_eSPI();
+HX711 scale;
+
+//======================================================================
+// 5. 核心功能函数
+//======================================================================
+
+//-------------------- 传感器读取 --------------------
+float readTemperature() {
+    int adcValue = analogRead(TEMP_ADC_PIN);
+    if (adcValue == 0) return -1; // 防止除零错误
+    float ntcResistance = R_DIVIDER * (1023.0 / adcValue - 1.0);
+    float steinhart = log(ntcResistance / NTC_NOMINAL_RES) / NTC_B_VALUE;
+    steinhart += 1.0 / (25.0 + 273.15);
+    steinhart = 1.0 / steinhart - 273.15;
+    return steinhart;
+}
+
+float getWeight() {
+  if (scale.is_ready()) {
+    float reading = scale.get_units(5); // 读取5次取平均值进行滤波
+    return (reading < 0) ? 0.0 : reading;
+  }
+  return -1; // 表示读取失败
+}
+
+//-------------------- 执行器控制 --------------------
+void setHeaterPower(int percentage) {
+    uint8_t pwmValue = map(constrain(percentage, 0, 100), 0, 100, 0, 255);
+    analogWrite(HEATER_PWM_PIN, pwmValue);
+}
+
+void controlPump(bool turnOn) {
+    digitalWrite(PUMP_GPIO_PIN, turnOn);
+}
+
+void dispensePowder(float grams) {
+    if (grams <= 0) return;
+    int stepsToTake = round(grams / POWDER_PER_STEP);
+    digitalWrite(MOTOR_DIR_PIN, HIGH); // 假设HIGH为正转
+    for (int i = 0; i < stepsToTake; i++) {
+        digitalWrite(MOTOR_STEP_PIN, HIGH);
+        delayMicroseconds(500); // 脉冲宽度
+        digitalWrite(MOTOR_STEP_PIN, LOW);
+        delayMicroseconds(500); // 脉冲间隔，共同决定速度
+    }
+}
+
+//-------------------- 人机交互 --------------------
+void updateDisplay() {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(10, 10);
+    tft.printf("温度: %.1f C / %.0f C", currentTemp, currentFormula.targetTemp);
+    tft.setCursor(10, 40);
+    tft.printf("水量: %.0f g / %.0f g", currentWeight, currentFormula.targetWater);
+    tft.setTextSize(3);
+    tft.setCursor(tft.width()/2 - tft.textWidth(statusMessage)/2, 80); // 居中显示
+    tft.print(statusMessage);
+}
+
+void beep(int duration_ms) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(duration_ms);
+    digitalWrite(BUZZER_PIN, LOW);
+}
+
+//-------------------- PID算法 --------------------
+void computePID() {
+    if (millis() - lastPidComputeTime < 1000) return; // 每秒计算一次
+    
+    pidInput = currentTemp;
+    double error = pidSetpoint - pidInput;
+    ITerm += (Ki * error);
+    ITerm = constrain(ITerm, 0, 100); // 抗积分饱和
+    double dInput = (pidInput - lastInput);
+    
+    pidOutput = Kp * error + ITerm - Kd * dInput;
+    pidOutput = constrain(pidOutput, 0, 100); // 限制输出范围
+    
+    setHeaterPower(pidOutput);
+    
+    lastInput = pidInput;
+    lastPidComputeTime = millis();
+}
+
+//======================================================================
+// 6. SETUP - 程序初始化
+//======================================================================
+void setup() {
+    Serial.begin(115200);
+
+    // 初始化执行器引脚
+    pinMode(PUMP_GPIO_PIN, OUTPUT);
+    pinMode(MOTOR_STEP_PIN, OUTPUT);
+    pinMode(MOTOR_DIR_PIN, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    analogWrite(HEATER_PWM_PIN, 0); // PWM引脚初始化
+    digitalWrite(PUMP_GPIO_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    // 初始化屏幕
+    tft.init();
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
+    tft.println("Initializing...");
+    delay(1000);
+
+    // 初始化重量传感器
+    scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+    scale.set_scale(WEIGHT_CAL_FACTOR);
+    scale.tare(10); // 开机去皮
+    
+    // 初始化用户输入
+    pinMode(BUTTON_START_PIN, INPUT_PULLUP);
+
+    // 加载默认配方并进入待机状态
+    currentFormula = savedFormulas[0]; // 默认加载配方1
+    currentState = IDLE;
+    statusMessage = "待机中";
+    beep(100);
+}
+
+//======================================================================
+// 7. LOOP - 主循环与状态机
+//======================================================================
+void loop() {
+    // 1. 持续更新传感器数据
+    currentTemp = readTemperature();
+    currentWeight = getWeight();
+    
+    // 2. 检查用户输入
+    checkUserInput();
+
+    // 3. 根据当前状态执行相应操作 (状态机)
+    switch (currentState) {
+      case IDLE:
+        setHeaterPower(0);
+        controlPump(false);
+        // 在IDLE状态下，如果用户按下开始键，则进入加热状态
+        if (digitalRead(BUTTON_START_PIN) == LOW) {
+            scale.tare(10); // 开始前先去皮
+            delay(100);
+            currentState = HEATING;
+            statusMessage = "正在加热";
+            pidSetpoint = currentFormula.targetTemp;
+            lastInput = currentTemp;
+            lastPidComputeTime = millis();
+            ITerm = 0;
+            beep(50);
+        }
+        break;
+
+      case HEATING:
+        computePID(); // 调用PID算法持续调节温度
+        // 如果温度达到目标值 (允许有微小误差)
+        if (abs(currentTemp - currentFormula.targetTemp) < 0.5) {
+            setHeaterPower(0); // 停止加热
+            currentState = DISPENSING_WATER;
+            statusMessage = "正在出水";
+            beep(50);
+        }
+        break;
+        
+      case DISPENSING_WATER:
+        controlPump(true); // 开启水泵
+        // 如果水量达到目标
+        if (currentWeight >= currentFormula.targetWater) {
+          controlPump(false); // 关闭水泵
+          currentState = TARING_AFTER_WATER;
+          statusMessage = "准备加粉";
+          delay(1000); // 等待水面稳定
+        }
+        break;
+
+      case TARING_AFTER_WATER:
+        scale.tare(10); // 加水后，将当前重量作为新的零点（去皮）
+        delay(100);
+        currentState = DISPENSING_POWDER;
+        statusMessage = "正在加粉";
+        beep(50);
+        break;
+
+      case DISPENSING_POWDER:
+        dispensePowder(currentFormula.targetPowder); // 一次性出完所有奶粉
+        currentState = COMPLETE;
+        statusMessage = "冲泡完成";
+        beep(500); // 长鸣提示完成
+        break;
+
+      case COMPLETE:
+        // 等待5秒后自动返回待机状态
+        delay(5000);
+        currentState = IDLE;
+        statusMessage = "待机中";
+        break;
+
+      case ERROR:
+        // 错误状态处理：停止所有执行器
+        setHeaterPower(0);
+        controlPump(false);
+        statusMessage = "发生错误!";
+        // 此处可添加代码等待用户干预
+        break;
+    }
+    
+    // 4. 更新屏幕显示
+    updateDisplay();
+
+    // 5. 稍微延时，防止loop过快
+    delay(100);
+}
+
+
+//======================================================================
+// 8. 辅助函数 (用户输入模拟)
+//======================================================================
+void checkUserInput(){
+  // 这是一个模拟函数
+  // 在真实产品中，您需要在这里编写代码来检测按键的长按、短按、旋钮旋转等
+  // 以实现切换配方 (savedFormulas[0], [1], [2])
+  // 或微调当前配方 (currentFormula) 的值
+  // 此处简化为只检测开始按钮，已在IDLE状态中处理
+}
